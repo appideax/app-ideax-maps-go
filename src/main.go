@@ -15,8 +15,10 @@ import (
 	"app-ideax-maps-go/shared/cache"
 	"app-ideax-maps-go/shared/logging"
 	"app-ideax-maps-go/shared/middleware"
+	"app-ideax-maps-go/shared/proxy"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/joho/godotenv"
 )
@@ -35,7 +37,8 @@ func main() {
 
 	infra := &app.Infrastructure{
 		Config: cfg,
-		Cache:  cache.NewMemoryCache(24 * time.Hour),
+		Cache:  cache.NewMemoryCache(cfg.Cache.MaxBytes),
+		HTTP:   proxy.NewHTTPClient(cfg.Upstream.Timeout),
 		Logger: appLogger,
 	}
 
@@ -44,7 +47,7 @@ func main() {
 		ReadTimeout:             30 * time.Second,
 		WriteTimeout:            30 * time.Second,
 		IdleTimeout:             60 * time.Second,
-		BodyLimit:               8 * 1024 * 1024,
+		BodyLimit:               1024 * 1024,
 		ProxyHeader:             fiber.HeaderXForwardedFor,
 		EnableTrustedProxyCheck: true,
 		TrustedProxies:          cfg.App.TrustedProxies,
@@ -68,6 +71,8 @@ func main() {
 	}))
 	fiberApp.Use(middleware.AccessLog(appLogger))
 	fiberApp.Use(middleware.CORS(cfg.App.CORSAllowedOrigins))
+	// El cache guarda el contenido plano; aca se comprime segun lo que acepte el cliente.
+	fiberApp.Use(compress.New(compress.Config{Level: compress.LevelBestSpeed}))
 
 	routes.Register(fiberApp, infra)
 

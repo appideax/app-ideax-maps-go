@@ -1,122 +1,118 @@
 package config
 
 import (
-	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func clearEnv() {
-	keys := []string{
-		"APP_ENV", "PORT", "LOG_LEVEL", "APP_DOMAIN", "CORS_ALLOWED_ORIGINS",
-		"JWT_SECRET", "MAP_TOKEN_TTL", "MAP_COOKIE_NAME", "MAP_COOKIE_DOMAIN",
-		"UPSTREAM_TILES_URL", "UPSTREAM_GLYPHS_URL", "UPSTREAM_PHOTON_URL",
-		"UPSTREAM_PELIAS_URL", "UPSTREAM_VALHALLA_URL", "RATE_LIMIT_PER_MINUTE",
-		"TRUSTED_PROXIES", "CACHE_TTL_TILES", "CACHE_TTL_GLYPHS", "CACHE_TTL_GEOCODE", "CACHE_TTL_VALHALLA",
-	}
-	for _, k := range keys {
-		os.Unsetenv(k)
+var envKeys = []string{
+	"APP_ENV", "PORT", "LOG_LEVEL", "CORS_ALLOWED_ORIGINS", "TRUSTED_PROXIES",
+	"MAPS_JWT_SECRET", "MAPS_COOKIE_NAME",
+	"UPSTREAM_TILES_URL", "UPSTREAM_GLYPHS_URL", "UPSTREAM_PHOTON_URL",
+	"UPSTREAM_PELIAS_URL", "UPSTREAM_VALHALLA_URL", "UPSTREAM_TIMEOUT",
+	"RATE_LIMIT_TILES_PER_MINUTE", "RATE_LIMIT_GEOCODE_PER_MINUTE", "RATE_LIMIT_ROUTING_PER_MINUTE",
+	"CACHE_MAX_MB", "CACHE_TTL_TILES", "CACHE_TTL_GLYPHS", "CACHE_TTL_GEOCODE",
+}
+
+func clearEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range envKeys {
+		t.Setenv(k, "")
 	}
 }
 
-func setValidEnv() {
-	os.Setenv("APP_DOMAIN", "maps-api.appideax.com")
-	os.Setenv("MAP_COOKIE_DOMAIN", ".appideax.com")
-	os.Setenv("UPSTREAM_TILES_URL", "https://maps.example.com/ecuador")
-	os.Setenv("UPSTREAM_GLYPHS_URL", "https://maps.example.com/font")
-	os.Setenv("UPSTREAM_PHOTON_URL", "https://photon.example.com")
-	os.Setenv("UPSTREAM_PELIAS_URL", "https://pelias.example.com")
-	os.Setenv("UPSTREAM_VALHALLA_URL", "https://valhalla.example.com")
-	os.Setenv("JWT_SECRET", "this-is-a-secret-key-for-tests-only-32")
+func setValidEnv(t *testing.T) {
+	t.Helper()
+	clearEnv(t)
+	t.Setenv("UPSTREAM_TILES_URL", "https://maps.example.com/ecuador/")
+	t.Setenv("UPSTREAM_GLYPHS_URL", "https://maps.example.com/font")
+	t.Setenv("UPSTREAM_PHOTON_URL", "https://photon.example.com")
+	t.Setenv("UPSTREAM_PELIAS_URL", "https://pelias.example.com")
+	t.Setenv("UPSTREAM_VALHALLA_URL", "https://valhalla.example.com")
+	t.Setenv("MAPS_JWT_SECRET", "this-is-a-secret-key-for-tests-only-32")
 }
 
 func TestLoad_Defaults(t *testing.T) {
-	clearEnv()
-	setValidEnv()
+	setValidEnv(t)
 
 	cfg, err := Load()
 	require.NoError(t, err)
 
 	assert.Equal(t, "development", cfg.App.Env)
-	assert.Equal(t, "3000", cfg.Server.Port)
-	assert.Equal(t, "maps-api.appideax.com", cfg.App.Domain)
+	assert.Equal(t, "3002", cfg.Server.Port)
 	assert.Equal(t, []string{"*"}, cfg.App.CORSAllowedOrigins)
-	assert.Equal(t, "maps_session", cfg.Map.CookieName)
-	assert.Equal(t, 120, cfg.RateLimit.PerMinute)
+	assert.Equal(t, "maps_session", cfg.Auth.CookieName)
+	assert.Equal(t, "https://maps.example.com/ecuador", cfg.Upstream.TilesURL)
+	assert.Equal(t, 10*time.Second, cfg.Upstream.Timeout)
+	assert.Equal(t, 1200, cfg.RateLimit.TilesPerMinute)
+	assert.Equal(t, 60, cfg.RateLimit.GeocodePerMinute)
+	assert.Equal(t, 60, cfg.RateLimit.RoutingPerMinute)
+	assert.Equal(t, int64(256*1024*1024), cfg.Cache.MaxBytes)
 }
 
 func TestLoad_MissingRequired(t *testing.T) {
-	clearEnv()
+	clearEnv(t)
 
 	_, err := Load()
 	require.Error(t, err)
 
-	assert.Contains(t, err.Error(), "APP_DOMAIN")
-	assert.Contains(t, err.Error(), "MAP_COOKIE_DOMAIN")
-	assert.Contains(t, err.Error(), "JWT_SECRET")
+	assert.Contains(t, err.Error(), "MAPS_JWT_SECRET")
+	assert.Contains(t, err.Error(), "UPSTREAM_TILES_URL")
+	assert.Contains(t, err.Error(), "UPSTREAM_VALHALLA_URL")
 }
 
-func TestLoad_InvalidAppEnv(t *testing.T) {
-	clearEnv()
-	setValidEnv()
-	os.Setenv("APP_ENV", "invalid")
+func TestLoad_InvalidValues(t *testing.T) {
+	cases := map[string]string{
+		"APP_ENV":                     "invalid",
+		"PORT":                        "abc",
+		"CACHE_TTL_TILES":             "not-a-duration",
+		"UPSTREAM_PHOTON_URL":         "photon.example.com",
+		"RATE_LIMIT_TILES_PER_MINUTE": "0",
+		"CACHE_MAX_MB":                "-1",
+	}
+	for key, value := range cases {
+		t.Run(key, func(t *testing.T) {
+			setValidEnv(t)
+			t.Setenv(key, value)
 
-	_, err := Load()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "APP_ENV")
-}
-
-func TestLoad_InvalidPort(t *testing.T) {
-	clearEnv()
-	setValidEnv()
-	os.Setenv("PORT", "abc")
-
-	_, err := Load()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "PORT")
-}
-
-func TestLoad_InvalidDuration(t *testing.T) {
-	clearEnv()
-	setValidEnv()
-	os.Setenv("CACHE_TTL_TILES", "not-a-duration")
-
-	_, err := Load()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "CACHE_TTL_TILES")
+			_, err := Load()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), key)
+		})
+	}
 }
 
 func TestLoad_ProductionRequiresCORS(t *testing.T) {
-	clearEnv()
-	setValidEnv()
-	os.Setenv("APP_ENV", "production")
-	os.Setenv("CORS_ALLOWED_ORIGINS", "")
+	setValidEnv(t)
+	t.Setenv("APP_ENV", "production")
 
 	_, err := Load()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "CORS_ALLOWED_ORIGINS")
 }
 
-func TestLoad_ProductionRequiresStrongJWT(t *testing.T) {
-	clearEnv()
-	setValidEnv()
-	os.Setenv("APP_ENV", "production")
-	os.Setenv("JWT_SECRET", "short")
+func TestLoad_ProductionRejectsWildcardCORS(t *testing.T) {
+	setValidEnv(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("CORS_ALLOWED_ORIGINS", "https://appideax.com,*")
 
 	_, err := Load()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "JWT_SECRET")
+	assert.Contains(t, err.Error(), "CORS_ALLOWED_ORIGINS")
 }
 
-func TestLoad_ProductionRejectsPlaceholderJWT(t *testing.T) {
-	clearEnv()
-	setValidEnv()
-	os.Setenv("APP_ENV", "production")
-	os.Setenv("JWT_SECRET", "change-me-in-production")
+func TestLoad_ProductionRequiresStrongSecret(t *testing.T) {
+	for _, secret := range []string{"short", "change-me-in-production"} {
+		setValidEnv(t)
+		t.Setenv("APP_ENV", "production")
+		t.Setenv("CORS_ALLOWED_ORIGINS", "https://appideax.com")
+		t.Setenv("MAPS_JWT_SECRET", secret)
 
-	_, err := Load()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "JWT_SECRET")
+		_, err := Load()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "MAPS_JWT_SECRET")
+	}
 }

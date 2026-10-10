@@ -7,14 +7,18 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
+// Register monta la geocodificacion. Los dos buscadores comparten contrato
+// (mismos parametros, misma respuesta); el reverse va siempre por Photon.
 func Register(router fiber.Router, infra *app.Infrastructure) {
 	handler := &Handler{Infra: infra}
 
-	group := router.Group("/geocode")
-	group.Use(middleware.Auth(infra.Config.JWT, infra.Config.Map.CookieName))
-	group.Use(middleware.GeocodeRateLimit(infra.Config.RateLimit.PerMinute))
+	auth := middleware.Auth(infra.Config.Auth)
+	limit := middleware.RateLimit("geocode", infra.Config.RateLimit.GeocodePerMinute)
 
-	group.Get("/search", handler.Search)
-	group.Get("/reverse", handler.Reverse)
-	group.Get("/structured", handler.Structured)
+	photon := router.Group("/geocode", auth, limit)
+	photon.Get("/search", handler.PhotonSearch)
+	photon.Get("/reverse", handler.PhotonReverse)
+
+	pelias := router.Group("/pelias", auth, limit)
+	pelias.Get("/search", handler.PeliasSearch)
 }

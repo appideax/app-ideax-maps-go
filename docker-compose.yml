@@ -6,5 +6,5 @@ services:
     container_name: maps-proxy-app
     env_file: .env
     ports:
-      - "${PORT:-3000}:${PORT:-3000}"
+      - "${PORT:-3002}:${PORT:-3002}"
     restart: unless-stopped

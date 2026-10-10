@@ -1,7 +1,7 @@
 package middleware
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 	"time"
 
@@ -12,110 +12,89 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-const MapClaimsContextKey = "map_claims"
+// Contrato con taxi-back-go (modulo maps): firma HS256 con MAPS_JWT_SECRET,
+// este emisor y esta audiencia, y un `sub` que identifica la sesion.
+const (
+	TokenIssuer   = "taxi-back-go"
+	TokenAudience = "maps-api"
+)
+
+const (
+	SubjectLocalKey = "maps_subject"
+	CompanyLocalKey = "company_id"
+)
 
 type MapClaims struct {
-	UserID    string   `json:"user_id"`
-	CompanyID string   `json:"company_id"`
-	Roles     []string `json:"roles"`
-	RideID    string   `json:"ride_id,omitempty"`
+	CompanyID string `json:"company_id,omitempty"`
 	jwt.RegisteredClaims
 }
 
-func extractToken(c *fiber.Ctx, cookieName string) string {
-	if cookie := c.Cookies(cookieName); cookie != "" {
-		return cookie
-	}
-
-	authHeader := c.Get("Authorization")
-	if authHeader != "" {
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) == 2 && parts[0] == "Bearer" {
-			return parts[1]
+// Auth acepta el token de mapas en `Authorization: Bearer` (app movil) o en la
+// cookie de sesion (navegador). No se acepta en la URL: quedaria en los logs.
+func Auth(cfg config.AuthConfig) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		candidates := tokenCandidates(c, cfg.CookieName)
+		if len(candidates) == 0 {
+			return response.Error(c, "missing token", fiber.StatusUnauthorized)
 		}
-	}
 
-	if token := c.Query("token"); token != "" {
-		return token
-	}
+		for _, candidate := range candidates {
+			claims, err := parseToken(candidate, cfg.JWTSecret)
+			if err != nil {
+				continue
+			}
+			c.Locals(SubjectLocalKey, claims.Subject)
+			c.Locals(CompanyLocalKey, claims.CompanyID)
+			return c.Next()
+		}
 
-	return ""
+		return response.Error(c, "invalid or expired token", fiber.StatusUnauthorized)
+	}
 }
 
-const (
-	expectedIssuer   = "taxi-back-go"
-	expectedAudience = "maps-api"
-)
-
-func parseAndValidate(tokenString string, secret string) (*MapClaims, error) {
-	claims := &MapClaims{}
-	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+func tokenCandidates(c *fiber.Ctx, cookieName string) []string {
+	candidates := make([]string, 0, 2)
+	if scheme, token, found := strings.Cut(c.Get(fiber.HeaderAuthorization), " "); found && scheme == "Bearer" {
+		if token = strings.TrimSpace(token); token != "" {
+			candidates = append(candidates, token)
 		}
+	}
+	if cookie := c.Cookies(cookieName); cookie != "" {
+		candidates = append(candidates, cookie)
+	}
+	return candidates
+}
+
+func parseToken(tokenString, secret string) (*MapClaims, error) {
+	claims := &MapClaims{}
+	_, err := jwt.ParseWithClaims(tokenString, claims, func(*jwt.Token) (interface{}, error) {
 		return []byte(secret), nil
-	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	},
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer(TokenIssuer),
+		jwt.WithAudience(TokenAudience),
+		jwt.WithExpirationRequired(),
+	)
 	if err != nil {
 		return nil, err
 	}
-	if !token.Valid {
-		return nil, fmt.Errorf("invalid token")
-	}
-	if claims.Issuer != expectedIssuer {
-		return nil, fmt.Errorf("invalid issuer")
-	}
-	if !audienceContains(claims.Audience, expectedAudience) {
-		return nil, fmt.Errorf("invalid audience")
-	}
-	if claims.UserID == "" && claims.RideID == "" {
-		return nil, fmt.Errorf("missing user_id or ride_id")
+	if claims.Subject == "" {
+		return nil, errors.New("missing subject")
 	}
 	return claims, nil
 }
 
-func audienceContains(aud jwt.ClaimStrings, value string) bool {
-	for _, v := range aud {
-		if v == value {
-			return true
-		}
-	}
-	return false
-}
-
-func Auth(cfg config.JWTConfig, cookieName string) fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		tokenString := extractToken(c, cookieName)
-		if tokenString == "" {
-			return response.Error(c, "missing or invalid token", fiber.StatusUnauthorized)
-		}
-
-		claims, err := parseAndValidate(tokenString, cfg.Secret)
-		if err != nil {
-			return response.Error(c, "invalid or expired token", fiber.StatusUnauthorized)
-		}
-
-		c.Locals("user_id", claims.UserID)
-		c.Locals("company_id", claims.CompanyID)
-		c.Locals("roles", claims.Roles)
-		c.Locals("ride_id", claims.RideID)
-		c.Locals(MapClaimsContextKey, claims)
-
-		return c.Next()
-	}
-}
-
-func BuildToken(secret string, ttl time.Duration, userID, companyID, rideID string, roles []string) (string, error) {
-	now := time.Now().UTC()
+// BuildToken firma un token como lo hace taxi-back-go. Solo lo usan las pruebas.
+func BuildToken(secret string, ttl time.Duration, subject, companyID string) (string, error) {
+	now := time.Now()
 	claims := MapClaims{
-		UserID:    userID,
 		CompanyID: companyID,
-		Roles:     roles,
-		RideID:    rideID,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    expectedIssuer,
-			Audience:  jwt.ClaimStrings{expectedAudience},
-			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			Issuer:    TokenIssuer,
+			Audience:  jwt.ClaimStrings{TokenAudience},
+			Subject:   subject,
 			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 		},
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
