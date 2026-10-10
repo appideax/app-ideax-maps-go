@@ -15,5 +15,6 @@ func Register(router fiber.Router, infra *app.Infrastructure) {
 	group.Use(middleware.RateLimit("routing", infra.Config.RateLimit.RoutingPerMinute))
 
 	group.Post("/route", handler.Route)
+	group.Post("/trace_route", handler.TraceRoute)
 	group.Post("/trace_attributes", handler.TraceAttributes)
 }

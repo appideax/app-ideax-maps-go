@@ -56,6 +56,14 @@ func TestRoute(t *testing.T) {
 	assert.Equal(t, `{"locations":[]}`, call.body)
 }
 
+func TestTraceRoute(t *testing.T) {
+	status, _, call := post(t, "/valhalla/trace_route", `{"shape":[]}`)
+
+	assert.Equal(t, http.StatusOK, status)
+	require.NotNil(t, call)
+	assert.Equal(t, "/trace_route", call.path)
+}
+
 func TestTraceAttributes(t *testing.T) {
 	status, _, call := post(t, "/valhalla/trace_attributes", `{"shape":[]}`)
 
