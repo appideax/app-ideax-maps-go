@@ -1,0 +1,10 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maps-proxy-app
+    env_file: .env
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    restart: unless-stopped

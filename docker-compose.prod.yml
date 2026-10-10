@@ -1,0 +1,21 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maps-proxy-app
+    env_file: .env
+    networks:
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.maps-proxy.rule=Host(`${APP_DOMAIN}`)"
+      - "traefik.http.routers.maps-proxy.entrypoints=websecure"
+      - "traefik.http.routers.maps-proxy.tls=true"
+      - "traefik.http.routers.maps-proxy.tls.certresolver=letsencrypt"
+      - "traefik.http.services.maps-proxy.loadbalancer.server.port=${PORT:-3000}"
+    restart: unless-stopped
+
+networks:
+  dokploy-network:
+    external: true
