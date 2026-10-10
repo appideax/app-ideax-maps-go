@@ -1,9 +1,8 @@
 services:
-  app:
+  maps-api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: maps-proxy-app
     env_file: .env
     ports:
       - "${PORT:-3002}:${PORT:-3002}"
