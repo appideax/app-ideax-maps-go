@@ -1,20 +1,32 @@
+# Despliegue en Dokploy (servicio tipo Compose). Las variables salen de la
+# pestana Environment de Dokploy, que las escribe en el .env junto a este archivo.
+#   APP_DOMAIN: dominio publico de este servicio (ej. maps-api.appideax.com)
+#   PORT: puerto en el que escucha la app; Traefik apunta al mismo (3002 si falta)
 services:
-  app:
+  maps-api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: maps-proxy-app
-    env_file: .env
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Los logs van al diario del servidor (journald) para que no se pierdan en
+    # cada despliegue. Consulta: journalctl CONTAINER_NAME=<contenedor> --since "..."
+    logging:
+      driver: journald
+      options:
+        tag: "docker/{{.Name}}"
     networks:
       - dokploy-network
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.maps-proxy.rule=Host(`${APP_DOMAIN}`)"
-      - "traefik.http.routers.maps-proxy.entrypoints=websecure"
-      - "traefik.http.routers.maps-proxy.tls=true"
-      - "traefik.http.routers.maps-proxy.tls.certresolver=letsencrypt"
-      - "traefik.http.services.maps-proxy.loadbalancer.server.port=${PORT:-3002}"
-    restart: unless-stopped
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.routers.maps-api.rule=Host(`${APP_DOMAIN}`)"
+      - "traefik.http.routers.maps-api.entrypoints=websecure"
+      - "traefik.http.routers.maps-api.tls=true"
+      - "traefik.http.routers.maps-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.maps-api.service=maps-api"
+      - "traefik.http.services.maps-api.loadbalancer.server.port=${PORT:-3002}"
 
 networks:
   dokploy-network:
