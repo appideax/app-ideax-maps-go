@@ -1,74 +1,74 @@
 package valhalla
 
 import (
-	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
-	"time"
 
 	"app-ideax-maps-go/internal/testutil"
-	"app-ideax-maps-go/shared/middleware"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func setupValhallaApp(t *testing.T, upstream *httptest.Server) (*fiber.App, string) {
-	t.Helper()
-	cfg := testutil.NewTestConfig()
-	cfg.Upstream.ValhallaURL = upstream.URL
-	infra := testutil.NewTestInfrastructure(cfg)
-
-	token, err := middleware.BuildToken(cfg.JWT.Secret, time.Hour, "user-123", "company-456", "", []string{"admin"})
-	require.NoError(t, err)
-
-	app := fiber.New()
-	Register(app, infra)
-	return app, token
+type upstreamCall struct {
+	path, contentType, body string
 }
 
-func TestHandler_Route(t *testing.T) {
+func post(t *testing.T, path, body string) (int, string, *upstreamCall) {
+	t.Helper()
+	var call *upstreamCall
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/route", r.URL.Path)
-		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
-		body, _ := io.ReadAll(r.Body)
-		assert.Equal(t, `{"locations":[]}`, string(body))
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		raw, _ := io.ReadAll(r.Body)
+		call = &upstreamCall{path: r.URL.Path, contentType: r.Header.Get("Content-Type"), body: string(raw)}
 		_, _ = w.Write([]byte(`{"trip":{}}`))
 	}))
 	defer upstream.Close()
 
-	app, token := setupValhallaApp(t, upstream)
+	cfg := testutil.NewTestConfig()
+	cfg.Upstream.ValhallaURL = upstream.URL
 
-	req := httptest.NewRequest(http.MethodPost, "/valhalla/route", bytes.NewReader([]byte(`{"locations":[]}`)))
-	req.Header.Set("Authorization", "Bearer "+token)
+	app := fiber.New()
+	Register(app, testutil.NewTestInfrastructure(cfg))
+
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+testutil.Token(t, cfg))
 	resp, err := app.Test(req, -1)
 	require.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-
-	body, err := io.ReadAll(resp.Body)
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	assert.Equal(t, `{"trip":{}}`, string(body))
-	resp.Body.Close()
+	return resp.StatusCode, string(raw), call
 }
 
-func TestHandler_Route_MissingBody(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
+func TestRoute(t *testing.T) {
+	status, body, call := post(t, "/valhalla/route", `{"locations":[]}`)
 
-	app, token := setupValhallaApp(t, upstream)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, `{"trip":{}}`, body)
+	require.NotNil(t, call)
+	assert.Equal(t, "/route", call.path)
+	assert.Equal(t, "application/json", call.contentType)
+	assert.Equal(t, `{"locations":[]}`, call.body)
+}
 
-	req := httptest.NewRequest(http.MethodPost, "/valhalla/route", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := app.Test(req, -1)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	resp.Body.Close()
+func TestTraceAttributes(t *testing.T) {
+	status, _, call := post(t, "/valhalla/trace_attributes", `{"shape":[]}`)
+
+	assert.Equal(t, http.StatusOK, status)
+	require.NotNil(t, call)
+	assert.Equal(t, "/trace_attributes", call.path)
+}
+
+func TestRoute_InvalidBody(t *testing.T) {
+	for _, body := range []string{"", "not-json"} {
+		status, _, call := post(t, "/valhalla/route", body)
+
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Nil(t, call)
+	}
 }

@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -13,8 +15,7 @@ import (
 type Config struct {
 	App       AppConfig
 	Server    ServerConfig
-	JWT       JWTConfig
-	Map       MapConfig
+	Auth      AuthConfig
 	Upstream  UpstreamConfig
 	RateLimit RateLimitConfig
 	Cache     CacheConfig
@@ -23,7 +24,6 @@ type Config struct {
 type AppConfig struct {
 	Env                string
 	LogLevel           slog.Level
-	Domain             string
 	CORSAllowedOrigins []string
 	TrustedProxies     []string
 }
@@ -32,14 +32,11 @@ type ServerConfig struct {
 	Port string
 }
 
-type JWTConfig struct {
-	Secret      string
-	MapTokenTTL time.Duration
-}
-
-type MapConfig struct {
-	CookieName   string
-	CookieDomain string
+// AuthConfig valida los tokens de mapas que firma taxi-back-go. El secreto es
+// el mismo MAPS_JWT_SECRET de ese servicio y no es su JWT_SECRET.
+type AuthConfig struct {
+	JWTSecret  string
+	CookieName string
 }
 
 type UpstreamConfig struct {
@@ -48,27 +45,26 @@ type UpstreamConfig struct {
 	PhotonURL   string
 	PeliasURL   string
 	ValhallaURL string
+	Timeout     time.Duration
 }
 
+// RateLimitConfig: peticiones por minuto de cada sesion de mapas. Las teselas
+// van aparte porque un solo movimiento del mapa pide decenas.
 type RateLimitConfig struct {
-	PerMinute int
+	TilesPerMinute   int
+	GeocodePerMinute int
+	RoutingPerMinute int
 }
 
 type CacheConfig struct {
-	TTLTiles    time.Duration
-	TTLGlyphs   time.Duration
-	TTLGeocode  time.Duration
-	TTLValhalla time.Duration
+	MaxBytes   int64
+	TTLTiles   time.Duration
+	TTLGlyphs  time.Duration
+	TTLGeocode time.Duration
 }
 
 func Load() (*Config, error) {
 	var errs []error
-
-	require := func(key, value string) {
-		if strings.TrimSpace(value) == "" {
-			errs = append(errs, fmt.Errorf("missing required environment variable: %s", key))
-		}
-	}
 
 	appEnv := strings.TrimSpace(os.Getenv("APP_ENV"))
 	if appEnv == "" {
@@ -80,7 +76,7 @@ func Load() (*Config, error) {
 		errs = append(errs, fmt.Errorf("invalid value for APP_ENV: %q (must be development, staging or production)", appEnv))
 	}
 
-	port, err := envPort("PORT", "3000")
+	port, err := envPort("PORT", "3002")
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -90,12 +86,9 @@ func Load() (*Config, error) {
 		errs = append(errs, err)
 	}
 
-	appDomain := strings.TrimSpace(os.Getenv("APP_DOMAIN"))
-	require("APP_DOMAIN", appDomain)
-
-	corsRaw := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
-	origins := parseOrigins(corsRaw)
-	if corsRaw == "" {
+	// Sin origenes configurados se acepta cualquiera, solo fuera de produccion.
+	origins := parseList(os.Getenv("CORS_ALLOWED_ORIGINS"))
+	if len(origins) == 0 {
 		if appEnv == "production" {
 			errs = append(errs, errors.New("missing required environment variable: CORS_ALLOWED_ORIGINS (required when APP_ENV=production)"))
 		} else {
@@ -103,48 +96,57 @@ func Load() (*Config, error) {
 		}
 	}
 
-	trustedProxiesRaw := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES"))
-	if trustedProxiesRaw == "" {
-		trustedProxiesRaw = "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+	trustedProxies := parseList(os.Getenv("TRUSTED_PROXIES"))
+	if len(trustedProxies) == 0 {
+		trustedProxies = []string{"127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
 	}
-	trustedProxies := make([]string, 0, 4)
-	for _, p := range strings.Split(trustedProxiesRaw, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			trustedProxies = append(trustedProxies, p)
+
+	jwtSecret := os.Getenv("MAPS_JWT_SECRET")
+	if strings.TrimSpace(jwtSecret) == "" {
+		errs = append(errs, errors.New("missing required environment variable: MAPS_JWT_SECRET"))
+	}
+	cookieName := envString("MAPS_COOKIE_NAME", "maps_session")
+
+	upstream := UpstreamConfig{}
+	for key, target := range map[string]*string{
+		"UPSTREAM_TILES_URL":    &upstream.TilesURL,
+		"UPSTREAM_GLYPHS_URL":   &upstream.GlyphsURL,
+		"UPSTREAM_PHOTON_URL":   &upstream.PhotonURL,
+		"UPSTREAM_PELIAS_URL":   &upstream.PeliasURL,
+		"UPSTREAM_VALHALLA_URL": &upstream.ValhallaURL,
+	} {
+		value, err := envURL(key)
+		if err != nil {
+			errs = append(errs, err)
 		}
+		*target = value
 	}
-
-	jwtSecret := os.Getenv("JWT_SECRET")
-	require("JWT_SECRET", jwtSecret)
-
-	mapTokenTTL, err := envDuration("MAP_TOKEN_TTL", 5*time.Minute)
+	upstream.Timeout, err = envDuration("UPSTREAM_TIMEOUT", 10*time.Second)
 	if err != nil {
 		errs = append(errs, err)
 	}
 
-	mapCookieName := getEnvOrDefault("MAP_COOKIE_NAME", "maps_session")
-	mapCookieDomain := strings.TrimSpace(os.Getenv("MAP_COOKIE_DOMAIN"))
-	require("MAP_COOKIE_DOMAIN", mapCookieDomain)
+	rateLimit := RateLimitConfig{}
+	for _, limit := range []struct {
+		key          string
+		defaultValue int
+		target       *int
+	}{
+		{"RATE_LIMIT_TILES_PER_MINUTE", 1200, &rateLimit.TilesPerMinute},
+		{"RATE_LIMIT_GEOCODE_PER_MINUTE", 60, &rateLimit.GeocodePerMinute},
+		{"RATE_LIMIT_ROUTING_PER_MINUTE", 60, &rateLimit.RoutingPerMinute},
+	} {
+		value, err := envPositiveInt(limit.key, limit.defaultValue)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		*limit.target = value
+	}
 
-	upstreamTilesURL := strings.TrimSpace(os.Getenv("UPSTREAM_TILES_URL"))
-	upstreamGlyphsURL := strings.TrimSpace(os.Getenv("UPSTREAM_GLYPHS_URL"))
-	upstreamPhotonURL := strings.TrimSpace(os.Getenv("UPSTREAM_PHOTON_URL"))
-	upstreamPeliasURL := strings.TrimSpace(os.Getenv("UPSTREAM_PELIAS_URL"))
-	upstreamValhallaURL := strings.TrimSpace(os.Getenv("UPSTREAM_VALHALLA_URL"))
-	require("UPSTREAM_TILES_URL", upstreamTilesURL)
-	require("UPSTREAM_GLYPHS_URL", upstreamGlyphsURL)
-	require("UPSTREAM_PHOTON_URL", upstreamPhotonURL)
-	require("UPSTREAM_PELIAS_URL", upstreamPeliasURL)
-	require("UPSTREAM_VALHALLA_URL", upstreamValhallaURL)
-
-	rateLimitPerMinute, err := envInt("RATE_LIMIT_PER_MINUTE", 120)
+	cacheMaxMB, err := envPositiveInt("CACHE_MAX_MB", 256)
 	if err != nil {
 		errs = append(errs, err)
 	}
-	if rateLimitPerMinute <= 0 {
-		errs = append(errs, errors.New("RATE_LIMIT_PER_MINUTE must be greater than 0"))
-	}
-
 	cacheTTLTiles, err := envDuration("CACHE_TTL_TILES", 24*time.Hour)
 	if err != nil {
 		errs = append(errs, err)
@@ -153,24 +155,20 @@ func Load() (*Config, error) {
 	if err != nil {
 		errs = append(errs, err)
 	}
-	cacheTTLGeocode, err := envDuration("CACHE_TTL_GEOCODE", 5*time.Minute)
-	if err != nil {
-		errs = append(errs, err)
-	}
-	cacheTTLValhalla, err := envDuration("CACHE_TTL_VALHALLA", 5*time.Minute)
+	cacheTTLGeocode, err := envDuration("CACHE_TTL_GEOCODE", 24*time.Hour)
 	if err != nil {
 		errs = append(errs, err)
 	}
 
 	if appEnv == "production" {
-		if containsWildcard(origins) {
+		if slices.Contains(origins, "*") {
 			errs = append(errs, errors.New(`invalid value for CORS_ALLOWED_ORIGINS: "*" is not allowed when APP_ENV=production`))
 		}
 		if len(jwtSecret) < 32 {
-			errs = append(errs, fmt.Errorf("invalid value for JWT_SECRET: must be at least 32 characters when APP_ENV=production (got %d)", len(jwtSecret)))
+			errs = append(errs, fmt.Errorf("invalid value for MAPS_JWT_SECRET: must be at least 32 characters when APP_ENV=production (got %d)", len(jwtSecret)))
 		}
-		if isPlaceholderJWTSecret(jwtSecret) {
-			errs = append(errs, errors.New("invalid value for JWT_SECRET: placeholder value is not allowed when APP_ENV=production"))
+		if isPlaceholderSecret(jwtSecret) {
+			errs = append(errs, errors.New("invalid value for MAPS_JWT_SECRET: placeholder value is not allowed when APP_ENV=production"))
 		}
 	}
 
@@ -182,80 +180,80 @@ func Load() (*Config, error) {
 		App: AppConfig{
 			Env:                appEnv,
 			LogLevel:           logLevel,
-			Domain:             appDomain,
 			CORSAllowedOrigins: origins,
 			TrustedProxies:     trustedProxies,
 		},
 		Server: ServerConfig{
 			Port: port,
 		},
-		JWT: JWTConfig{
-			Secret:      jwtSecret,
-			MapTokenTTL: mapTokenTTL,
+		Auth: AuthConfig{
+			JWTSecret:  jwtSecret,
+			CookieName: cookieName,
 		},
-		Map: MapConfig{
-			CookieName:   mapCookieName,
-			CookieDomain: mapCookieDomain,
-		},
-		Upstream: UpstreamConfig{
-			TilesURL:    upstreamTilesURL,
-			GlyphsURL:   upstreamGlyphsURL,
-			PhotonURL:   upstreamPhotonURL,
-			PeliasURL:   upstreamPeliasURL,
-			ValhallaURL: upstreamValhallaURL,
-		},
-		RateLimit: RateLimitConfig{
-			PerMinute: rateLimitPerMinute,
-		},
+		Upstream:  upstream,
+		RateLimit: rateLimit,
 		Cache: CacheConfig{
-			TTLTiles:    cacheTTLTiles,
-			TTLGlyphs:   cacheTTLGlyphs,
-			TTLGeocode:  cacheTTLGeocode,
-			TTLValhalla: cacheTTLValhalla,
+			MaxBytes:   int64(cacheMaxMB) * 1024 * 1024,
+			TTLTiles:   cacheTTLTiles,
+			TTLGlyphs:  cacheTTLGlyphs,
+			TTLGeocode: cacheTTLGeocode,
 		},
 	}, nil
 }
 
-func envInt(key string, defaultValue int) (int, error) {
-	raw := os.Getenv(key)
-	if strings.TrimSpace(raw) == "" {
+func envString(key, defaultValue string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return defaultValue
+}
+
+func envPositiveInt(key string, defaultValue int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
 		return defaultValue, nil
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil {
-		return 0, fmt.Errorf("invalid value for %s: %q is not a valid integer", key, raw)
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid value for %s: %q must be an integer greater than 0", key, raw)
 	}
 	return n, nil
 }
 
 func envDuration(key string, defaultValue time.Duration) (time.Duration, error) {
-	raw := os.Getenv(key)
-	if strings.TrimSpace(raw) == "" {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
 		return defaultValue, nil
 	}
-	d, err := time.ParseDuration(strings.TrimSpace(raw))
-	if err != nil {
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
 		return 0, fmt.Errorf("invalid value for %s: %q is not a valid duration (e.g. 5m, 24h, 720h)", key, raw)
 	}
 	return d, nil
 }
 
 func envPort(key, defaultValue string) (string, error) {
-	raw := os.Getenv(key)
-	if strings.TrimSpace(raw) == "" {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
 		return defaultValue, nil
 	}
-	if _, err := strconv.Atoi(strings.TrimSpace(raw)); err != nil {
+	if n, err := strconv.Atoi(raw); err != nil || n < 1 || n > 65535 {
 		return "", fmt.Errorf("invalid value for %s: %q is not a valid port", key, raw)
 	}
-	return strings.TrimSpace(raw), nil
+	return raw, nil
 }
 
-func getEnvOrDefault(key, defaultValue string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// envURL exige una URL http(s) y la devuelve sin la barra final.
+func envURL(key string) (string, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return "", fmt.Errorf("missing required environment variable: %s", key)
 	}
-	return defaultValue
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("invalid value for %s: %q is not an http(s) URL", key, raw)
+	}
+	return strings.TrimRight(raw, "/"), nil
 }
 
 func parseLogLevel(raw string) (slog.Level, error) {
@@ -273,30 +271,18 @@ func parseLogLevel(raw string) (slog.Level, error) {
 	}
 }
 
-func parseOrigins(raw string) []string {
-	if raw == "" {
-		return nil
-	}
+func parseList(raw string) []string {
 	parts := strings.Split(raw, ",")
-	origins := make([]string, 0, len(parts))
+	items := make([]string, 0, len(parts))
 	for _, part := range parts {
-		if origin := strings.TrimSpace(part); origin != "" {
-			origins = append(origins, origin)
+		if item := strings.TrimSpace(part); item != "" {
+			items = append(items, item)
 		}
 	}
-	return origins
+	return items
 }
 
-func containsWildcard(origins []string) bool {
-	for _, origin := range origins {
-		if origin == "*" {
-			return true
-		}
-	}
-	return false
-}
-
-func isPlaceholderJWTSecret(secret string) bool {
+func isPlaceholderSecret(secret string) bool {
 	switch strings.ToLower(strings.TrimSpace(secret)) {
 	case "your-secret-key-change-in-production", "changeme", "change-me-in-production", "secret", "123456789", "apikey123456789":
 		return true

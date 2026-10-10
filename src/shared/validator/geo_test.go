@@ -4,64 +4,50 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestParseZoom(t *testing.T) {
 	z, err := ParseZoom("10")
-	require.NoError(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, 10, z)
 
-	_, err = ParseZoom("-1")
-	require.Error(t, err)
-
-	_, err = ParseZoom("23")
-	require.Error(t, err)
-
-	_, err = ParseZoom("abc")
-	require.Error(t, err)
+	for _, raw := range []string{"-1", "23", "abc", ""} {
+		_, err = ParseZoom(raw)
+		assert.Error(t, err, raw)
+	}
 }
 
 func TestParseTileCoord(t *testing.T) {
-	x, err := ParseTileCoord(10, "512")
-	require.NoError(t, err)
-	assert.Equal(t, 512, x)
+	x, err := ParseTileCoord(2, "3")
+	assert.NoError(t, err)
+	assert.Equal(t, 3, x)
 
-	_, err = ParseTileCoord(10, "-1")
-	require.Error(t, err)
-
-	_, err = ParseTileCoord(1, "2")
-	require.Error(t, err)
+	for _, raw := range []string{"4", "-1", "abc"} {
+		_, err = ParseTileCoord(2, raw)
+		assert.Error(t, err, raw)
+	}
 }
 
-func TestParseLatLon(t *testing.T) {
-	lat, lon, err := ParseLatLon("-0.1807", "-78.4678")
-	require.NoError(t, err)
+func TestParseLatLng(t *testing.T) {
+	lat, lng, err := ParseLatLng("-0.1807", "-78.4678")
+	assert.NoError(t, err)
 	assert.InDelta(t, -0.1807, lat, 0.0001)
-	assert.InDelta(t, -78.4678, lon, 0.0001)
+	assert.InDelta(t, -78.4678, lng, 0.0001)
 
-	_, _, err = ParseLatLon("91", "0")
-	require.Error(t, err)
-
-	_, _, err = ParseLatLon("0", "181")
-	require.Error(t, err)
-
-	_, _, err = ParseLatLon("abc", "0")
-	require.Error(t, err)
+	for _, pair := range [][2]string{{"91", "0"}, {"0", "181"}, {"", "0"}, {"0", "abc"}, {"NaN", "0"}, {"0", "Inf"}} {
+		_, _, err = ParseLatLng(pair[0], pair[1])
+		assert.Error(t, err, pair)
+	}
 }
 
-func TestParseLimit(t *testing.T) {
-	limit, err := ParseLimit("")
-	require.NoError(t, err)
-	assert.Equal(t, 10, limit)
+func TestParseBBox(t *testing.T) {
+	box, ok := ParseBBox("-78.6, -0.4, -78.3, 0")
+	assert.True(t, ok)
+	assert.Equal(t, BBox{MinLon: -78.6, MinLat: -0.4, MaxLon: -78.3, MaxLat: 0}, box)
+	assert.Equal(t, "-78.6,-0.4,-78.3,0", box.String())
 
-	limit, err = ParseLimit("50")
-	require.NoError(t, err)
-	assert.Equal(t, 50, limit)
-
-	_, err = ParseLimit("0")
-	require.Error(t, err)
-
-	_, err = ParseLimit("101")
-	require.Error(t, err)
+	for _, raw := range []string{"", "1,2,3", "a,b,c,d", "-78.3,-0.4,-78.6,0", "-78.6,0,-78.3,-0.4", "-200,-0.4,-78.3,0", "NaN,0,1,1"} {
+		_, ok = ParseBBox(raw)
+		assert.False(t, ok, raw)
+	}
 }

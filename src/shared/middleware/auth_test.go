@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,168 +14,101 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func testAuthMiddleware(secret, cookieName string) fiber.Handler {
-	cfg := config.JWTConfig{Secret: secret}
-	return Auth(cfg, cookieName)
+const testSecret = "test-secret-key-with-at-least-32-characters"
+
+func authApp() *fiber.App {
+	app := fiber.New()
+	app.Use(Auth(config.AuthConfig{JWTSecret: testSecret, CookieName: "maps_session"}))
+	app.Get("/test", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"subject": c.Locals(SubjectLocalKey),
+			"company": c.Locals(CompanyLocalKey),
+		})
+	})
+	return app
+}
+
+func authStatus(t *testing.T, prepare func(*http.Request)) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	prepare(req)
+	resp, err := authApp().Test(req, -1)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+func validToken(t *testing.T) string {
+	t.Helper()
+	token, err := BuildToken(testSecret, time.Hour, "user-123", "company-456")
+	require.NoError(t, err)
+	return token
+}
+
+// signClaims firma claims arbitrarios para probar los rechazos.
+func signClaims(t *testing.T, secret string, mutate func(*MapClaims)) string {
+	t.Helper()
+	claims := &MapClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    TokenIssuer,
+			Audience:  jwt.ClaimStrings{TokenAudience},
+			Subject:   "user-123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}
+	mutate(claims)
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+	require.NoError(t, err)
+	return token
 }
 
 func TestAuth_BearerValid(t *testing.T) {
-	secret := "test-secret-key-with-at-least-32-characters"
-	token, err := BuildToken(secret, time.Hour, "user-123", "company-456", "", []string{"admin"})
-	require.NoError(t, err)
-
-	app := fiber.New()
-	app.Use(testAuthMiddleware(secret, "maps_session"))
-	app.Get("/test", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"user_id":    c.Locals("user_id"),
-			"company_id": c.Locals("company_id"),
-			"roles":      c.Locals("roles"),
-		})
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := app.Test(req, -1)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	discardBody(t, resp)
-}
-
-func TestAuth_QueryTokenValid(t *testing.T) {
-	secret := "test-secret-key-with-at-least-32-characters"
-	token, err := BuildToken(secret, time.Hour, "", "", "ride-789", []string{})
-	require.NoError(t, err)
-
-	app := fiber.New()
-	app.Use(testAuthMiddleware(secret, "maps_session"))
-	app.Get("/test", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"ride_id": c.Locals("ride_id")})
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/test?token="+token, nil)
-	resp, err := app.Test(req, -1)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	discardBody(t, resp)
+	token := validToken(t)
+	status := authStatus(t, func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+token) })
+	assert.Equal(t, http.StatusOK, status)
 }
 
 func TestAuth_CookieValid(t *testing.T) {
-	secret := "test-secret-key-with-at-least-32-characters"
-	token, err := BuildToken(secret, time.Hour, "user-123", "company-456", "", []string{"admin"})
-	require.NoError(t, err)
-
-	app := fiber.New()
-	app.Use(testAuthMiddleware(secret, "maps_session"))
-	app.Get("/test", func(c *fiber.Ctx) error {
-		return c.SendStatus(fiber.StatusOK)
+	token := validToken(t)
+	status := authStatus(t, func(r *http.Request) {
+		r.AddCookie(&http.Cookie{Name: "maps_session", Value: token})
 	})
+	assert.Equal(t, http.StatusOK, status)
+}
 
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.AddCookie(&http.Cookie{Name: "maps_session", Value: token})
-	resp, err := app.Test(req, -1)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	discardBody(t, resp)
+func TestAuth_ValidCookieWinsOverStaleBearer(t *testing.T) {
+	token := validToken(t)
+	status := authStatus(t, func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer stale")
+		r.AddCookie(&http.Cookie{Name: "maps_session", Value: token})
+	})
+	assert.Equal(t, http.StatusOK, status)
 }
 
 func TestAuth_MissingToken(t *testing.T) {
-	app := fiber.New()
-	app.Use(testAuthMiddleware("test-secret-key-with-at-least-32-characters", "maps_session"))
-	app.Get("/test", func(c *fiber.Ctx) error {
-		return c.SendStatus(fiber.StatusOK)
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	resp, err := app.Test(req, -1)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	discardBody(t, resp)
+	assert.Equal(t, http.StatusUnauthorized, authStatus(t, func(*http.Request) {}))
 }
 
-func TestAuth_ExpiredToken(t *testing.T) {
-	secret := "test-secret-key-with-at-least-32-characters"
-	token, err := BuildToken(secret, -time.Hour, "user-123", "", "", []string{"admin"})
-	require.NoError(t, err)
-
-	app := fiber.New()
-	app.Use(testAuthMiddleware(secret, "maps_session"))
-	app.Get("/test", func(c *fiber.Ctx) error {
-		return c.SendStatus(fiber.StatusOK)
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := app.Test(req, -1)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	discardBody(t, resp)
+func TestAuth_QueryTokenNotAccepted(t *testing.T) {
+	token := validToken(t)
+	status := authStatus(t, func(r *http.Request) { r.URL.RawQuery = "token=" + token })
+	assert.Equal(t, http.StatusUnauthorized, status)
 }
 
-func TestAuth_InvalidSignature(t *testing.T) {
-	secret := "test-secret-key-with-at-least-32-characters"
-	token, err := BuildToken(secret, time.Hour, "user-123", "", "", []string{"admin"})
-	require.NoError(t, err)
-
-	app := fiber.New()
-	app.Use(testAuthMiddleware("different-secret-key-with-at-least-32-characters", "maps_session"))
-	app.Get("/test", func(c *fiber.Ctx) error {
-		return c.SendStatus(fiber.StatusOK)
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := app.Test(req, -1)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	discardBody(t, resp)
-}
-
-func TestAuth_MissingUserAndRide(t *testing.T) {
-	secret := "test-secret-key-with-at-least-32-characters"
-	claims := MapClaims{
-		CompanyID: "company-456",
-		Roles:     []string{"admin"},
-		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    expectedIssuer,
-			Audience:  jwt.ClaimStrings{expectedAudience},
-			ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(time.Hour)),
-		},
+func TestAuth_RejectsInvalidTokens(t *testing.T) {
+	cases := map[string]string{
+		"wrong secret":   signClaims(t, "another-secret-key-with-at-least-32-chars", func(*MapClaims) {}),
+		"wrong issuer":   signClaims(t, testSecret, func(c *MapClaims) { c.Issuer = "someone-else" }),
+		"wrong audience": signClaims(t, testSecret, func(c *MapClaims) { c.Audience = jwt.ClaimStrings{"api"} }),
+		"no subject":     signClaims(t, testSecret, func(c *MapClaims) { c.Subject = "" }),
+		"expired":        signClaims(t, testSecret, func(c *MapClaims) { c.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-time.Minute)) }),
+		"no expiration":  signClaims(t, testSecret, func(c *MapClaims) { c.ExpiresAt = nil }),
+		"garbage":        "not-a-jwt",
 	}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
-	require.NoError(t, err)
-
-	app := fiber.New()
-	app.Use(testAuthMiddleware(secret, "maps_session"))
-	app.Get("/test", func(c *fiber.Ctx) error {
-		return c.SendStatus(fiber.StatusOK)
-	})
-
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := app.Test(req, -1)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	discardBody(t, resp)
-}
-
-func TestBuildToken(t *testing.T) {
-	secret := "test-secret-key-with-at-least-32-characters"
-	token, err := BuildToken(secret, time.Hour, "user-123", "company-456", "ride-789", []string{"admin"})
-	require.NoError(t, err)
-	assert.NotEmpty(t, token)
-
-	claims, err := parseAndValidate(token, secret)
-	require.NoError(t, err)
-	assert.Equal(t, "user-123", claims.UserID)
-	assert.Equal(t, "company-456", claims.CompanyID)
-	assert.Equal(t, "ride-789", claims.RideID)
-	assert.Equal(t, []string{"admin"}, claims.Roles)
-}
-
-func discardBody(t *testing.T, resp *http.Response) {
-	t.Helper()
-	_, err := io.Copy(io.Discard, resp.Body)
-	require.NoError(t, err)
-	resp.Body.Close()
+	for name, token := range cases {
+		t.Run(name, func(t *testing.T) {
+			status := authStatus(t, func(r *http.Request) { r.Header.Set("Authorization", "Bearer "+token) })
+			assert.Equal(t, http.StatusUnauthorized, status)
+		})
+	}
 }

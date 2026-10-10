@@ -41,14 +41,11 @@ func AccessLog(logger *slog.Logger) fiber.Handler {
 		if rid, ok := c.Locals(RequestIDKey).(string); ok && rid != "" {
 			attrs = append(attrs, "requestId", rid)
 		}
-		if uid, ok := c.Locals("user_id").(string); ok && uid != "" {
-			attrs = append(attrs, "userId", uid)
+		if subject, ok := c.Locals(SubjectLocalKey).(string); ok && subject != "" {
+			attrs = append(attrs, "subject", subject)
 		}
-		if cid, ok := c.Locals("company_id").(string); ok && cid != "" {
+		if cid, ok := c.Locals(CompanyLocalKey).(string); ok && cid != "" {
 			attrs = append(attrs, "companyId", cid)
-		}
-		if rID, ok := c.Locals("ride_id").(string); ok && rID != "" {
-			attrs = append(attrs, "rideId", rID)
 		}
 		if err != nil {
 			attrs = append(attrs, "error", err.Error())

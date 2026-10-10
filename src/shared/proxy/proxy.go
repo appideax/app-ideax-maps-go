@@ -4,206 +4,132 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
-	"sort"
-	"strings"
 	"time"
 
 	"app-ideax-maps-go/app"
+	"app-ideax-maps-go/shared/response"
 
 	"github.com/gofiber/fiber/v2"
 )
 
-const UserAgent = "AppIdeaxMapsProxy/1.0"
+const (
+	UserAgent = "AppIdeaxMapsProxy/1.0"
 
-var sensitiveHeaders = map[string]struct{}{
-	"Authorization": {},
-	"Cookie":        {},
-	"Set-Cookie":    {},
-	"X-Api-Key":     {},
-	"X-Api-Secret":  {},
-}
+	ContentTypeJSON     = "application/json; charset=utf-8"
+	ContentTypeProtobuf = "application/x-protobuf"
+
+	// Tope de lo que se lee de un servicio de mapas en una respuesta.
+	maxUpstreamBody = 16 * 1024 * 1024
+)
 
 type Options struct {
-	UpstreamBaseURL    string
-	TargetPath         string
-	AllowedParams      []string
-	CacheKey           string
-	CacheTTL           time.Duration
-	Method             string
-	Body               []byte
-	ContentType        string
-	DefaultContentType string
-	QueryParams        url.Values
-	// Transform recibe el body crudo del upstream y devuelve el body que se
-	// enviará al cliente. Se ejecuta antes de guardar en caché.
+	UpstreamBaseURL string
+	TargetPath      string
+	Query           url.Values
+	// Method y Body: por defecto GET sin cuerpo.
+	Method string
+	Body   []byte
+	// ContentType es el de la respuesta al cliente.
+	ContentType string
+	// Con CacheKey y CacheTTL la respuesta se guarda y se reutiliza.
+	CacheKey string
+	CacheTTL time.Duration
+	// Transform recibe el body crudo del upstream y devuelve el que se envia al
+	// cliente. Se ejecuta antes de guardar en cache.
 	Transform func([]byte) ([]byte, error)
 }
 
+// NewHTTPClient arma el cliente compartido hacia los servicios de mapas. No se
+// fija Accept-Encoding: asi Go descomprime solo y el cache guarda el contenido
+// plano; la compresion hacia el cliente la hace el middleware de Fiber.
+func NewHTTPClient(timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 32
+	return &http.Client{Timeout: timeout, Transport: transport}
+}
+
+// Forward pide el recurso al servicio de mapas y lo devuelve al cliente. Del
+// request del cliente no se reenvia ninguna cabecera, y de la respuesta del
+// upstream solo salen el estado y el cuerpo.
 func Forward(c *fiber.Ctx, infra *app.Infrastructure, opts Options) error {
-	if opts.Method == "" {
-		opts.Method = c.Method()
-	}
+	cacheable := opts.CacheKey != "" && opts.CacheTTL > 0
 
-	upstreamURL, err := buildUpstreamURL(opts.UpstreamBaseURL, opts.TargetPath, opts.QueryParams, opts.AllowedParams)
-	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, "invalid upstream URL")
-	}
-
-	if opts.CacheKey != "" && opts.CacheTTL > 0 {
+	if cacheable {
 		if cached, ok := infra.Cache.Get(opts.CacheKey); ok {
-			setCacheHeaders(c, opts.CacheTTL)
-			if opts.DefaultContentType != "" {
-				c.Set("Content-Type", opts.DefaultContentType)
-			}
-			return c.Status(fiber.StatusOK).Send(cached)
+			return send(c, fiber.StatusOK, cached, opts)
 		}
 	}
 
-	body := opts.Body
-	if body == nil && opts.Method != http.MethodGet && opts.Method != http.MethodHead {
-		body = c.Body()
+	method := opts.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	upstreamURL := opts.UpstreamBaseURL + opts.TargetPath
+	if len(opts.Query) > 0 {
+		upstreamURL += "?" + opts.Query.Encode()
 	}
 
-	req, err := http.NewRequestWithContext(c.UserContext(), opts.Method, upstreamURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(c.UserContext(), method, upstreamURL, bytes.NewReader(opts.Body))
 	if err != nil {
-		if infra.Logger != nil {
-			infra.Logger.Error("proxy: failed to build upstream request", "error", err)
-		}
-		return fiber.NewError(fiber.StatusInternalServerError, "proxy error")
+		infra.Logger.Error("proxy: failed to build upstream request", "url", upstreamURL, "error", err)
+		return response.Error(c, "proxy error", fiber.StatusInternalServerError)
 	}
-
 	req.Header.Set("User-Agent", UserAgent)
-	if ae := c.Get("Accept-Encoding"); ae != "" {
-		req.Header.Set("Accept-Encoding", ae)
-	}
-	if opts.ContentType != "" {
-		req.Header.Set("Content-Type", opts.ContentType)
+	if len(opts.Body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-	resp, err := client.Do(req)
+	resp, err := infra.HTTP.Do(req)
 	if err != nil {
-		if infra.Logger != nil {
-			infra.Logger.Error("proxy: upstream request failed", "url", upstreamURL, "error", err)
-		}
-		return fiber.NewError(fiber.StatusBadGateway, "upstream unavailable")
+		infra.Logger.Error("proxy: upstream request failed", "url", upstreamURL, "error", err)
+		return response.Error(c, "upstream unavailable", fiber.StatusBadGateway)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		if infra.Logger != nil {
-			infra.Logger.Error("proxy: failed to read upstream response", "url", upstreamURL, "error", err)
-		}
-		return fiber.NewError(fiber.StatusBadGateway, "upstream error")
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBody+1))
+	if err != nil || len(body) > maxUpstreamBody {
+		infra.Logger.Error("proxy: failed to read upstream response", "url", upstreamURL, "error", err, "bytes", len(body))
+		return response.Error(c, "upstream error", fiber.StatusBadGateway)
 	}
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 && opts.Transform != nil {
-		transformed, err := opts.Transform(respBody)
+	switch {
+	case resp.StatusCode >= 500:
+		infra.Logger.Error("proxy: upstream error", "url", upstreamURL, "status", resp.StatusCode)
+		return response.Error(c, "upstream error", fiber.StatusBadGateway)
+	case resp.StatusCode >= 300:
+		// Errores del pedido (4xx): el cliente recibe el detalle del servicio.
+		c.Set(fiber.HeaderCacheControl, "no-store")
+		c.Set(fiber.HeaderContentType, ContentTypeJSON)
+		return c.Status(resp.StatusCode).Send(body)
+	case len(body) == 0:
+		// Tesela vacia: Martin responde 204.
+		return c.SendStatus(fiber.StatusNoContent)
+	}
+
+	if opts.Transform != nil {
+		body, err = opts.Transform(body)
 		if err != nil {
-			if infra.Logger != nil {
-				infra.Logger.Error("proxy: transform failed", "url", upstreamURL, "error", err)
-			}
-			return fiber.NewError(fiber.StatusBadGateway, "upstream response invalid")
-		}
-		respBody = transformed
-	}
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 && len(respBody) > 0 && opts.CacheKey != "" && opts.CacheTTL > 0 {
-		infra.Cache.Set(opts.CacheKey, respBody, opts.CacheTTL)
-	}
-
-	setResponseHeaders(c, resp)
-	return c.Status(resp.StatusCode).Send(respBody)
-}
-
-func buildUpstreamURL(baseURL, targetPath string, params url.Values, allowedParams []string) (string, error) {
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", err
-	}
-	base.Path = strings.TrimSuffix(base.Path, "/") + targetPath
-
-	if params != nil {
-		if len(allowedParams) > 0 {
-			base.RawQuery = FilterQuery(params, allowedParams).Encode()
-		} else {
-			base.RawQuery = params.Encode()
+			infra.Logger.Error("proxy: transform failed", "url", upstreamURL, "error", err)
+			return response.Error(c, "upstream response invalid", fiber.StatusBadGateway)
 		}
 	}
 
-	return base.String(), nil
-}
-
-func setCacheHeaders(c *fiber.Ctx, ttl time.Duration) {
-	c.Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(ttl.Seconds())))
-}
-
-func setResponseHeaders(c *fiber.Ctx, resp *http.Response) {
-	for key, values := range resp.Header {
-		if _, sensitive := sensitiveHeaders[key]; sensitive {
-			continue
-		}
-		for _, value := range values {
-			c.Set(key, value)
-		}
+	if cacheable {
+		infra.Cache.Set(opts.CacheKey, body, opts.CacheTTL)
 	}
+
+	return send(c, fiber.StatusOK, body, opts)
 }
 
-func CacheKey(parts ...string) string {
-	clean := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			clean = append(clean, p)
-		}
+func send(c *fiber.Ctx, status int, body []byte, opts Options) error {
+	// "private": la respuesta depende de la sesion, solo la guarda el navegador.
+	if opts.CacheTTL > 0 {
+		c.Set(fiber.HeaderCacheControl, fmt.Sprintf("private, max-age=%d", int(opts.CacheTTL.Seconds())))
+	} else {
+		c.Set(fiber.HeaderCacheControl, "no-store")
 	}
-	sort.Strings(clean)
-	return strings.Join(clean, "|")
-}
-
-func QueryParams(c *fiber.Ctx) url.Values {
-	params := make(url.Values)
-	c.Request().URI().QueryArgs().VisitAll(func(key, value []byte) {
-		params.Add(string(key), string(value))
-	})
-	return params
-}
-
-func FilterQuery(params url.Values, allowed []string) url.Values {
-	allowedSet := make(map[string]struct{}, len(allowed))
-	for _, p := range allowed {
-		allowedSet[p] = struct{}{}
-	}
-	filtered := make(url.Values)
-	for key, values := range params {
-		if _, ok := allowedSet[key]; ok {
-			for _, v := range values {
-				filtered.Add(key, v)
-			}
-		}
-	}
-	return filtered
-}
-
-func CopyRequestHeaders(dst http.Header, src *fiber.Ctx) {
-	for key, values := range src.GetReqHeaders() {
-		if _, sensitive := sensitiveHeaders[key]; sensitive {
-			continue
-		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func LogProxyError(logger *slog.Logger, msg string, attrs ...any) {
-	if logger != nil {
-		logger.Error(msg, attrs...)
-	}
+	c.Set(fiber.HeaderContentType, opts.ContentType)
+	return c.Status(status).Send(body)
 }

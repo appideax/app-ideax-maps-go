@@ -1,6 +1,9 @@
 package valhalla
 
 import (
+	"encoding/json"
+	"net/http"
+
 	"app-ideax-maps-go/app"
 	"app-ideax-maps-go/shared/proxy"
 	"app-ideax-maps-go/shared/response"
@@ -12,34 +15,29 @@ type Handler struct {
 	Infra *app.Infrastructure
 }
 
+// Route: POST /valhalla/route
 func (h *Handler) Route(c *fiber.Ctx) error {
-	body := c.Body()
-	if len(body) == 0 {
-		return response.Error(c, "missing request body", fiber.StatusBadRequest)
-	}
-
-	return proxy.Forward(c, h.Infra, proxy.Options{
-		UpstreamBaseURL:    h.Infra.Config.Upstream.ValhallaURL,
-		TargetPath:         "/route",
-		Method:             "POST",
-		Body:               body,
-		ContentType:        "application/json",
-		DefaultContentType: "application/json; charset=utf-8",
-	})
+	return h.forward(c, "/route")
 }
 
+// TraceAttributes: POST /valhalla/trace_attributes
 func (h *Handler) TraceAttributes(c *fiber.Ctx) error {
+	return h.forward(c, "/trace_attributes")
+}
+
+// forward reenvia el pedido JSON a Valhalla tal cual. No se cachea: cada ruta
+// sale de la posicion del momento.
+func (h *Handler) forward(c *fiber.Ctx, targetPath string) error {
 	body := c.Body()
-	if len(body) == 0 {
-		return response.Error(c, "missing request body", fiber.StatusBadRequest)
+	if !json.Valid(body) {
+		return response.Error(c, "request body must be valid JSON", fiber.StatusBadRequest)
 	}
 
 	return proxy.Forward(c, h.Infra, proxy.Options{
-		UpstreamBaseURL:    h.Infra.Config.Upstream.ValhallaURL,
-		TargetPath:         "/trace_attributes",
-		Method:             "POST",
-		Body:               body,
-		ContentType:        "application/json",
-		DefaultContentType: "application/json; charset=utf-8",
+		UpstreamBaseURL: h.Infra.Config.Upstream.ValhallaURL,
+		TargetPath:      targetPath,
+		Method:          http.MethodPost,
+		Body:            body,
+		ContentType:     proxy.ContentTypeJSON,
 	})
 }
