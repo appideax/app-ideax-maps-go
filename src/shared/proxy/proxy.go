@@ -39,6 +39,11 @@ type Options struct {
 	// Transform recibe el body crudo del upstream y devuelve el que se envia al
 	// cliente. Se ejecuta antes de guardar en cache.
 	Transform func([]byte) ([]byte, error)
+	// Fallbacks son consultas alternativas: se prueban en orden mientras IsEmpty
+	// diga que la respuesta (ya transformada) no trae nada. La ultima se envia
+	// tal cual, y todas comparten CacheKey.
+	Fallbacks []url.Values
+	IsEmpty   func([]byte) bool
 }
 
 // NewHTTPClient arma el cliente compartido hacia los servicios de mapas. No se
@@ -62,19 +67,39 @@ func Forward(c *fiber.Ctx, infra *app.Infrastructure, opts Options) error {
 		}
 	}
 
+	queries := append([]url.Values{opts.Query}, opts.Fallbacks...)
+	for i, query := range queries {
+		body, ok, err := fetch(c, infra, opts, query)
+		if !ok {
+			return err
+		}
+		if i < len(queries)-1 && opts.IsEmpty != nil && opts.IsEmpty(body) {
+			continue
+		}
+		if cacheable {
+			infra.Cache.Set(opts.CacheKey, body, opts.CacheTTL)
+		}
+		return send(c, fiber.StatusOK, body, opts)
+	}
+	return nil
+}
+
+// fetch hace un pedido al upstream y devuelve el cuerpo ya transformado. Con
+// ok en false la respuesta al cliente ya quedo escrita y err es su resultado.
+func fetch(c *fiber.Ctx, infra *app.Infrastructure, opts Options, query url.Values) (body []byte, ok bool, err error) {
 	method := opts.Method
 	if method == "" {
 		method = http.MethodGet
 	}
 	upstreamURL := opts.UpstreamBaseURL + opts.TargetPath
-	if len(opts.Query) > 0 {
-		upstreamURL += "?" + opts.Query.Encode()
+	if len(query) > 0 {
+		upstreamURL += "?" + query.Encode()
 	}
 
 	req, err := http.NewRequestWithContext(c.UserContext(), method, upstreamURL, bytes.NewReader(opts.Body))
 	if err != nil {
 		infra.Logger.Error("proxy: failed to build upstream request", "url", upstreamURL, "error", err)
-		return response.Error(c, "proxy error", fiber.StatusInternalServerError)
+		return nil, false, response.Error(c, "proxy error", fiber.StatusInternalServerError)
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	if len(opts.Body) > 0 {
@@ -84,43 +109,38 @@ func Forward(c *fiber.Ctx, infra *app.Infrastructure, opts Options) error {
 	resp, err := infra.HTTP.Do(req)
 	if err != nil {
 		infra.Logger.Error("proxy: upstream request failed", "url", upstreamURL, "error", err)
-		return response.Error(c, "upstream unavailable", fiber.StatusBadGateway)
+		return nil, false, response.Error(c, "upstream unavailable", fiber.StatusBadGateway)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBody+1))
+	body, err = io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBody+1))
 	if err != nil || len(body) > maxUpstreamBody {
 		infra.Logger.Error("proxy: failed to read upstream response", "url", upstreamURL, "error", err, "bytes", len(body))
-		return response.Error(c, "upstream error", fiber.StatusBadGateway)
+		return nil, false, response.Error(c, "upstream error", fiber.StatusBadGateway)
 	}
 
 	switch {
 	case resp.StatusCode >= 500:
 		infra.Logger.Error("proxy: upstream error", "url", upstreamURL, "status", resp.StatusCode)
-		return response.Error(c, "upstream error", fiber.StatusBadGateway)
+		return nil, false, response.Error(c, "upstream error", fiber.StatusBadGateway)
 	case resp.StatusCode >= 300:
 		// Errores del pedido (4xx): el cliente recibe el detalle del servicio.
 		c.Set(fiber.HeaderCacheControl, "no-store")
 		c.Set(fiber.HeaderContentType, ContentTypeJSON)
-		return c.Status(resp.StatusCode).Send(body)
+		return nil, false, c.Status(resp.StatusCode).Send(body)
 	case len(body) == 0:
 		// Tesela vacia: Martin responde 204.
-		return c.SendStatus(fiber.StatusNoContent)
+		return nil, false, c.SendStatus(fiber.StatusNoContent)
 	}
 
 	if opts.Transform != nil {
 		body, err = opts.Transform(body)
 		if err != nil {
 			infra.Logger.Error("proxy: transform failed", "url", upstreamURL, "error", err)
-			return response.Error(c, "upstream response invalid", fiber.StatusBadGateway)
+			return nil, false, response.Error(c, "upstream response invalid", fiber.StatusBadGateway)
 		}
 	}
-
-	if cacheable {
-		infra.Cache.Set(opts.CacheKey, body, opts.CacheTTL)
-	}
-
-	return send(c, fiber.StatusOK, body, opts)
+	return body, true, nil
 }
 
 func send(c *fiber.Ctx, status int, body []byte, opts Options) error {
