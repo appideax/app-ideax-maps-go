@@ -1,6 +1,7 @@
 package geocode
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -123,4 +124,10 @@ func joinAddress(parts ...string) string {
 		clean = append(clean, part)
 	}
 	return strings.Join(clean, ", ")
+}
+
+var emptyResponse, _ = json.Marshal(Response{Results: []Result{}})
+
+func isEmpty(body []byte) bool {
+	return bytes.Equal(body, emptyResponse)
 }

@@ -20,11 +20,14 @@ type upstreamCall struct {
 }
 
 // get llama a path con un token valido contra un upstream que responde payload.
+// Devuelve la primera llamada al upstream: las demas son reintentos.
 func get(t *testing.T, path, payload string) (int, string, *upstreamCall) {
 	t.Helper()
 	var call *upstreamCall
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		call = &upstreamCall{path: r.URL.Path, query: r.URL.Query()}
+		if call == nil {
+			call = &upstreamCall{path: r.URL.Path, query: r.URL.Query()}
+		}
 		_, _ = w.Write([]byte(payload))
 	}))
 	defer upstream.Close()
@@ -121,13 +124,87 @@ func TestPeliasSearch(t *testing.T) {
 		{"id":"-0.20000, -78.50000","address":"-0.20000, -78.50000","latitude":-0.2,"longitude":-78.5}
 	]}`, body)
 	require.NotNil(t, call)
-	assert.Equal(t, "/v1/search", call.path)
+	assert.Equal(t, "/v1/autocomplete", call.path)
 	assert.Equal(t, "amazonas y naciones unidas", call.query.Get("text"))
 	assert.Equal(t, "8", call.query.Get("size"))
 	assert.Equal(t, "es", call.query.Get("lang"))
 	assert.Equal(t, "EC", call.query.Get("boundary.country"))
 	assert.Equal(t, "-78.6", call.query.Get("boundary.rect.min_lon"))
 	assert.Equal(t, "0", call.query.Get("boundary.rect.max_lat"))
+	assert.False(t, call.query.Has("focus.point.lat"))
+}
+
+func TestSearch_Focus(t *testing.T) {
+	_, _, call := get(t, "/pelias/search?q=riocentro&focus=-0.18065,-78.46783", `{"features":[]}`)
+	require.NotNil(t, call)
+	assert.Equal(t, "-0.18", call.query.Get("focus.point.lat"))
+	assert.Equal(t, "-78.47", call.query.Get("focus.point.lon"))
+
+	_, _, call = get(t, "/geocode/search?q=riocentro&focus=-0.18065,-78.46783", `{"features":[]}`)
+	require.NotNil(t, call)
+	assert.Equal(t, "-0.18", call.query.Get("lat"))
+	assert.Equal(t, "-78.47", call.query.Get("lon"))
+	assert.Equal(t, "12", call.query.Get("zoom"))
+}
+
+func TestSearch_InvalidFocusIsIgnored(t *testing.T) {
+	for _, focus := range []string{"", "quito", "91,0", "0,abc"} {
+		_, _, call := get(t, "/geocode/search?q=riocentro&focus="+focus, `{"features":[]}`)
+
+		require.NotNil(t, call, focus)
+		assert.False(t, call.query.Has("lat"), focus)
+		assert.False(t, call.query.Has("zoom"), focus)
+	}
+}
+
+// Sin resultados se reintenta con las variantes del texto hasta que una acierta.
+func TestSearch_RetriesWithAlternatives(t *testing.T) {
+	for path, key := range map[string]string{"/pelias/search": "text", "/geocode/search": "q"} {
+		var texts []string
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			text := r.URL.Query().Get(key)
+			texts = append(texts, text)
+			if text == "RioCentro quito" {
+				_, _ = w.Write([]byte(`{"features":[{"geometry":{"coordinates":[-78.4764,-0.1666]},"properties":{"name":"RioCentro Shopping"}}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"features":[]}`))
+		}))
+
+		cfg := testutil.NewTestConfig()
+		cfg.Upstream.PhotonURL = upstream.URL
+		cfg.Upstream.PeliasURL = upstream.URL
+		app := fiber.New()
+		Register(app, testutil.NewTestInfrastructure(cfg))
+
+		req := httptest.NewRequest(http.MethodGet, path+"?q=centro+comercial+Rio+Centro+quito", nil)
+		req.Header.Set("Authorization", "Bearer "+testutil.Token(t, cfg))
+		resp, err := app.Test(req, -1)
+		require.NoError(t, err)
+		raw, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		resp.Body.Close()
+		upstream.Close()
+
+		assert.Equal(t, []string{"centro comercial Rio Centro quito", "Rio Centro quito", "RioCentro quito"}, texts, path)
+		assert.Contains(t, string(raw), "RioCentro Shopping", path)
+	}
+}
+
+func TestAlternatives(t *testing.T) {
+	cases := map[string][]string{
+		"riocentro":                         nil,
+		"mall":                              nil,
+		"rio centro":                        {"riocentro"},
+		"Centro Comercial El Recreo":        {"El Recreo", "ElRecreo"},
+		"cc quicentro":                      {"quicentro"},
+		"edificio la previsora":             {"la previsora", "laprevisora"},
+		"centro comercial Rio Centro quito": {"Rio Centro quito", "RioCentro quito"},
+		"amazonas y naciones unidas":        {"amazonasy naciones unidas"},
+	}
+	for text, want := range cases {
+		assert.Equal(t, want, alternatives(text), text)
+	}
 }
 
 func TestUpstreamGarbageIsBadGateway(t *testing.T) {

@@ -18,6 +18,8 @@ const (
 	maxQueryLength = 200
 	countryCode    = "EC"
 	defaultLocale  = "es"
+	// Zoom con el que Photon prioriza por cercania: abarca una ciudad.
+	photonFocusZoom = "12"
 )
 
 // Rectangulo de busqueda por defecto: Ecuador y una franja cercana.
@@ -27,7 +29,7 @@ type Handler struct {
 	Infra *app.Infrastructure
 }
 
-// PhotonSearch: GET /geocode/search?q=&locale=&bbox=minLon,minLat,maxLon,maxLat
+// PhotonSearch: GET /geocode/search?q=&locale=&bbox=minLon,minLat,maxLon,maxLat&focus=lat,lng
 func (h *Handler) PhotonSearch(c *fiber.Ctx) error {
 	q, ok := searchText(c)
 	if !ok {
@@ -47,8 +49,13 @@ func (h *Handler) PhotonSearch(c *fiber.Ctx) error {
 	query.Set("limit", strconv.Itoa(searchLimit))
 	query.Set("bbox", bbox.String())
 	query.Set("countrycode", countryCode)
+	if lat, lng, ok := focusPoint(c); ok {
+		query.Set("lat", lat)
+		query.Set("lon", lng)
+		query.Set("zoom", photonFocusZoom)
+	}
 
-	return h.forward(c, h.Infra.Config.Upstream.PhotonURL, "/api", query, photonTransform)
+	return h.search(c, h.Infra.Config.Upstream.PhotonURL, "/api", query, "q", photonTransform)
 }
 
 // PhotonReverse: GET /geocode/reverse?lat=&lng=&locale=
@@ -68,7 +75,9 @@ func (h *Handler) PhotonReverse(c *fiber.Ctx) error {
 	return h.forward(c, h.Infra.Config.Upstream.PhotonURL, "/reverse", query, photonTransform)
 }
 
-// PeliasSearch: GET /pelias/search?q=&locale=&bbox=minLon,minLat,maxLon,maxLat
+// PeliasSearch: GET /pelias/search?q=&locale=&bbox=minLon,minLat,maxLon,maxLat&focus=lat,lng
+// Va por autocomplete: empata por prefijo mientras se escribe y encuentra los
+// lugares por nombre (edificios, centros comerciales), no solo direcciones.
 func (h *Handler) PeliasSearch(c *fiber.Ctx) error {
 	q, ok := searchText(c)
 	if !ok {
@@ -86,8 +95,38 @@ func (h *Handler) PeliasSearch(c *fiber.Ctx) error {
 		query.Set("boundary.rect.max_lon", strconv.FormatFloat(bbox.MaxLon, 'g', -1, 64))
 		query.Set("boundary.rect.max_lat", strconv.FormatFloat(bbox.MaxLat, 'g', -1, 64))
 	}
+	if lat, lng, ok := focusPoint(c); ok {
+		query.Set("focus.point.lat", lat)
+		query.Set("focus.point.lon", lng)
+	}
 
-	return h.forward(c, h.Infra.Config.Upstream.PeliasURL, "/v1/search", query, peliasTransform)
+	return h.search(c, h.Infra.Config.Upstream.PeliasURL, "/v1/autocomplete", query, "text", peliasTransform)
+}
+
+// search es forward con reintentos: si el texto no trae resultados se prueban
+// sus variantes (ver alternatives). textKey es el parametro que lleva el texto.
+func (h *Handler) search(c *fiber.Ctx, baseURL, targetPath string, query url.Values, textKey string, transform func([]byte) ([]byte, error)) error {
+	var fallbacks []url.Values
+	for _, text := range alternatives(query.Get(textKey)) {
+		alt := url.Values{}
+		for key, values := range query {
+			alt[key] = values
+		}
+		alt.Set(textKey, text)
+		fallbacks = append(fallbacks, alt)
+	}
+
+	return proxy.Forward(c, h.Infra, proxy.Options{
+		UpstreamBaseURL: baseURL,
+		TargetPath:      targetPath,
+		Query:           query,
+		ContentType:     proxy.ContentTypeJSON,
+		CacheKey:        baseURL + targetPath + "?" + query.Encode(),
+		CacheTTL:        h.Infra.Config.Cache.TTLGeocode,
+		Transform:       transform,
+		Fallbacks:       fallbacks,
+		IsEmpty:         isEmpty,
+	})
 }
 
 func (h *Handler) forward(c *fiber.Ctx, baseURL, targetPath string, query url.Values, transform func([]byte) ([]byte, error)) error {
@@ -105,6 +144,21 @@ func (h *Handler) forward(c *fiber.Ctx, baseURL, targetPath string, query url.Va
 func searchText(c *fiber.Ctx) (string, bool) {
 	q := strings.TrimSpace(c.Query("q"))
 	return q, q != "" && len(q) <= maxQueryLength
+}
+
+// focusPoint lee focus=lat,lng: el punto alrededor del cual se priorizan los
+// resultados, sin descartar los lejanos. Dos decimales (alrededor de 1 km):
+// quienes buscan desde la misma zona comparten la entrada de cache.
+func focusPoint(c *fiber.Ctx) (lat, lng string, ok bool) {
+	rawLat, rawLng, found := strings.Cut(c.Query("focus"), ",")
+	if !found {
+		return "", "", false
+	}
+	latitude, longitude, err := validator.ParseLatLng(strings.TrimSpace(rawLat), strings.TrimSpace(rawLng))
+	if err != nil {
+		return "", "", false
+	}
+	return strconv.FormatFloat(latitude, 'f', 2, 64), strconv.FormatFloat(longitude, 'f', 2, 64), true
 }
 
 func locale(raw string) string {
