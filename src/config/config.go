@@ -42,7 +42,6 @@ type AuthConfig struct {
 type UpstreamConfig struct {
 	TilesURL    string
 	GlyphsURL   string
-	PhotonURL   string
 	PeliasURL   string
 	ValhallaURL string
 	Timeout     time.Duration
@@ -111,7 +110,6 @@ func Load() (*Config, error) {
 	for key, target := range map[string]*string{
 		"UPSTREAM_TILES_URL":    &upstream.TilesURL,
 		"UPSTREAM_GLYPHS_URL":   &upstream.GlyphsURL,
-		"UPSTREAM_PHOTON_URL":   &upstream.PhotonURL,
 		"UPSTREAM_PELIAS_URL":   &upstream.PeliasURL,
 		"UPSTREAM_VALHALLA_URL": &upstream.ValhallaURL,
 	} {

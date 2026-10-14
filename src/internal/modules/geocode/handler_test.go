@@ -33,7 +33,6 @@ func get(t *testing.T, path, payload string) (int, string, *upstreamCall) {
 	defer upstream.Close()
 
 	cfg := testutil.NewTestConfig()
-	cfg.Upstream.PhotonURL = upstream.URL
 	cfg.Upstream.PeliasURL = upstream.URL
 
 	app := fiber.New()
@@ -49,35 +48,6 @@ func get(t *testing.T, path, payload string) (int, string, *upstreamCall) {
 	return resp.StatusCode, string(raw), call
 }
 
-func TestPhotonSearch(t *testing.T) {
-	status, body, call := get(t, "/geocode/search?q=av+amazonas&locale=es", `{"features":[]}`)
-
-	assert.Equal(t, http.StatusOK, status)
-	assert.Equal(t, `{"results":[]}`, body)
-	require.NotNil(t, call)
-	assert.Equal(t, "/api", call.path)
-	assert.Equal(t, "av amazonas", call.query.Get("q"))
-	assert.Equal(t, "default", call.query.Get("lang"))
-	assert.Equal(t, "8", call.query.Get("limit"))
-	assert.Equal(t, "EC", call.query.Get("countrycode"))
-	assert.Equal(t, "-81.5,-6.5,-74.5,1.5", call.query.Get("bbox"))
-}
-
-func TestPhotonSearch_ClientBBoxAndLang(t *testing.T) {
-	_, _, call := get(t, "/geocode/search?q=quito&locale=en&bbox=-78.6,-0.4,-78.3,0", `{"features":[]}`)
-
-	require.NotNil(t, call)
-	assert.Equal(t, "en", call.query.Get("lang"))
-	assert.Equal(t, "-78.6,-0.4,-78.3,0", call.query.Get("bbox"))
-}
-
-func TestPhotonSearch_InvalidBBoxFallsBackToEcuador(t *testing.T) {
-	_, _, call := get(t, "/geocode/search?q=quito&bbox=1,2,3", `{"features":[]}`)
-
-	require.NotNil(t, call)
-	assert.Equal(t, "-81.5,-6.5,-74.5,1.5", call.query.Get("bbox"))
-}
-
 func TestSearch_MissingQuery(t *testing.T) {
 	for _, path := range []string{"/geocode/search", "/geocode/search?q=+", "/pelias/search"} {
 		status, _, call := get(t, path, `{"features":[]}`)
@@ -87,20 +57,21 @@ func TestSearch_MissingQuery(t *testing.T) {
 	}
 }
 
-func TestPhotonReverse(t *testing.T) {
-	status, body, call := get(t, "/geocode/reverse?lat=-0.18065312&lng=-78.46783812&locale=es",
-		`{"features":[{"geometry":{"coordinates":[-78.4678,-0.1807]},"properties":{"osm_type":"W","osm_id":123,"name":"Parque La Carolina","street":"Av. Amazonas","housenumber":"N34","city":"Quito","state":"Pichincha","country":"Ecuador"}}]}`)
+func TestReverse(t *testing.T) {
+	status, body, call := get(t, "/geocode/reverse?lat=-0.18065312&lng=-78.46783812&locale=en",
+		`{"features":[{"geometry":{"coordinates":[-78.4678,-0.1807]},"properties":{"gid":"osm:venue:1","name":"Parque La Carolina","street":"Av. Amazonas","housenumber":"N34","locality":"Quito","region":"Pichincha"}}]}`)
 
 	assert.Equal(t, http.StatusOK, status)
-	assert.JSONEq(t, `{"results":[{"id":"W123","address":"Parque La Carolina, Av. Amazonas N34, Quito, Pichincha","latitude":-0.1807,"longitude":-78.4678}]}`, body)
+	assert.JSONEq(t, `{"results":[{"id":"pelias:osm:venue:1","address":"Parque La Carolina, Av. Amazonas N34, Quito, Pichincha","latitude":-0.1807,"longitude":-78.4678}]}`, body)
 	require.NotNil(t, call)
-	assert.Equal(t, "/reverse", call.path)
-	assert.Equal(t, "-0.1807", call.query.Get("lat"))
-	assert.Equal(t, "-78.4678", call.query.Get("lon"))
-	assert.Equal(t, "1", call.query.Get("limit"))
+	assert.Equal(t, "/v1/reverse", call.path)
+	assert.Equal(t, "-0.1807", call.query.Get("point.lat"))
+	assert.Equal(t, "-78.4678", call.query.Get("point.lon"))
+	assert.Equal(t, "en", call.query.Get("lang"))
+	assert.Equal(t, "1", call.query.Get("size"))
 }
 
-func TestPhotonReverse_InvalidCoords(t *testing.T) {
+func TestReverse_InvalidCoords(t *testing.T) {
 	for _, path := range []string{"/geocode/reverse", "/geocode/reverse?lat=91&lng=0", "/geocode/reverse?lat=0&lng=abc", "/geocode/reverse?lat=NaN&lng=0"} {
 		status, _, call := get(t, path, `{"features":[]}`)
 
@@ -109,7 +80,7 @@ func TestPhotonReverse_InvalidCoords(t *testing.T) {
 	}
 }
 
-func TestPeliasSearch(t *testing.T) {
+func TestSearch(t *testing.T) {
 	status, body, call := get(t, "/pelias/search?q=amazonas+y+naciones+unidas&locale=es&bbox=-78.6,-0.4,-78.3,0",
 		`{"features":[
 			{"geometry":{"coordinates":[-78.48,-0.17]},"properties":{"gid":"osm:1","name":"Av. Amazonas","locality":"Quito","region":"Pichincha"}},
@@ -134,17 +105,16 @@ func TestPeliasSearch(t *testing.T) {
 	assert.False(t, call.query.Has("focus.point.lat"))
 }
 
+// Las dos rutas de busqueda son la misma.
 func TestSearch_Focus(t *testing.T) {
-	_, _, call := get(t, "/pelias/search?q=riocentro&focus=-0.18065,-78.46783", `{"features":[]}`)
-	require.NotNil(t, call)
-	assert.Equal(t, "-0.18", call.query.Get("focus.point.lat"))
-	assert.Equal(t, "-78.47", call.query.Get("focus.point.lon"))
+	for _, path := range []string{"/pelias/search", "/geocode/search"} {
+		_, _, call := get(t, path+"?q=riocentro&focus=-0.18065,-78.46783", `{"features":[]}`)
 
-	_, _, call = get(t, "/geocode/search?q=riocentro&focus=-0.18065,-78.46783", `{"features":[]}`)
-	require.NotNil(t, call)
-	assert.Equal(t, "-0.18", call.query.Get("lat"))
-	assert.Equal(t, "-78.47", call.query.Get("lon"))
-	assert.Equal(t, "12", call.query.Get("zoom"))
+		require.NotNil(t, call, path)
+		assert.Equal(t, "/v1/autocomplete", call.path, path)
+		assert.Equal(t, "-0.18", call.query.Get("focus.point.lat"), path)
+		assert.Equal(t, "-78.47", call.query.Get("focus.point.lon"), path)
+	}
 }
 
 func TestSearch_InvalidFocusIsIgnored(t *testing.T) {
@@ -152,17 +122,16 @@ func TestSearch_InvalidFocusIsIgnored(t *testing.T) {
 		_, _, call := get(t, "/geocode/search?q=riocentro&focus="+focus, `{"features":[]}`)
 
 		require.NotNil(t, call, focus)
-		assert.False(t, call.query.Has("lat"), focus)
-		assert.False(t, call.query.Has("zoom"), focus)
+		assert.False(t, call.query.Has("focus.point.lat"), focus)
 	}
 }
 
 // Sin resultados se reintenta con las variantes del texto hasta que una acierta.
 func TestSearch_RetriesWithAlternatives(t *testing.T) {
-	for path, key := range map[string]string{"/pelias/search": "text", "/geocode/search": "q"} {
+	for _, path := range []string{"/pelias/search", "/geocode/search"} {
 		var texts []string
 		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			text := r.URL.Query().Get(key)
+			text := r.URL.Query().Get("text")
 			texts = append(texts, text)
 			if text == "RioCentro quito" {
 				_, _ = w.Write([]byte(`{"features":[{"geometry":{"coordinates":[-78.4764,-0.1666]},"properties":{"name":"RioCentro Shopping"}}]}`))
@@ -172,7 +141,6 @@ func TestSearch_RetriesWithAlternatives(t *testing.T) {
 		}))
 
 		cfg := testutil.NewTestConfig()
-		cfg.Upstream.PhotonURL = upstream.URL
 		cfg.Upstream.PeliasURL = upstream.URL
 		app := fiber.New()
 		Register(app, testutil.NewTestInfrastructure(cfg))
