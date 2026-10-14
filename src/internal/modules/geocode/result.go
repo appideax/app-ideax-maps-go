@@ -7,8 +7,7 @@ import (
 	"strings"
 )
 
-// Result es el formato unico de geocodificacion que reciben los clientes, venga
-// de Photon o de Pelias.
+// Result es el formato unico de geocodificacion que reciben los clientes.
 type Result struct {
 	ID        string  `json:"id"`
 	Address   string  `json:"address"`
@@ -25,37 +24,20 @@ type feature struct {
 		Coordinates []float64 `json:"coordinates"`
 	} `json:"geometry"`
 	Properties struct {
-		// Photon
-		OSMType string  `json:"osm_type"`
-		OSMID   float64 `json:"osm_id"`
-		City    string  `json:"city"`
-		State   string  `json:"state"`
-		// Pelias
-		GID      string `json:"gid"`
-		Locality string `json:"locality"`
-		Region   string `json:"region"`
-		// Ambos
+		GID         string `json:"gid"`
+		Locality    string `json:"locality"`
+		Region      string `json:"region"`
 		Name        string `json:"name"`
 		Street      string `json:"street"`
 		HouseNumber string `json:"housenumber"`
 	} `json:"properties"`
 }
 
-func photonTransform(body []byte) ([]byte, error) {
-	return transform(body, func(f *feature) (string, string) {
-		id := ""
-		if f.Properties.OSMType != "" && f.Properties.OSMID != 0 {
-			id = fmt.Sprintf("%s%d", f.Properties.OSMType, int64(f.Properties.OSMID))
-		}
-		return id, joinAddress(f.Properties.Name, street(f), f.Properties.City, f.Properties.State)
-	})
-}
-
 func peliasTransform(body []byte) ([]byte, error) {
 	return transform(body, func(f *feature) (string, string) {
 		id := ""
 		if f.Properties.GID != "" {
-			// El prefijo evita chocar con los ids de Photon cuando se comparan ambos.
+			// Prefijo historico: los clientes ya guardan ids con esta forma.
 			id = "pelias:" + f.Properties.GID
 		}
 		return id, joinAddress(f.Properties.Name, street(f), f.Properties.Locality, f.Properties.Region)

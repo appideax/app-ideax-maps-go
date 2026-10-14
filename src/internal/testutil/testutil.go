@@ -29,7 +29,6 @@ func NewTestConfig() *config.Config {
 		Upstream: config.UpstreamConfig{
 			TilesURL:    "https://maps.example.com/ecuador",
 			GlyphsURL:   "https://maps.example.com/font",
-			PhotonURL:   "https://photon.example.com",
 			PeliasURL:   "https://pelias.example.com",
 			ValhallaURL: "https://valhalla.example.com",
 			Timeout:     5 * time.Second,

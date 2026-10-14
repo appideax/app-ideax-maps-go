@@ -11,7 +11,7 @@ import (
 var envKeys = []string{
 	"APP_ENV", "PORT", "LOG_LEVEL", "CORS_ALLOWED_ORIGINS", "TRUSTED_PROXIES",
 	"MAPS_JWT_SECRET", "MAPS_COOKIE_NAME",
-	"UPSTREAM_TILES_URL", "UPSTREAM_GLYPHS_URL", "UPSTREAM_PHOTON_URL",
+	"UPSTREAM_TILES_URL", "UPSTREAM_GLYPHS_URL",
 	"UPSTREAM_PELIAS_URL", "UPSTREAM_VALHALLA_URL", "UPSTREAM_TIMEOUT",
 	"RATE_LIMIT_TILES_PER_MINUTE", "RATE_LIMIT_GEOCODE_PER_MINUTE", "RATE_LIMIT_ROUTING_PER_MINUTE",
 	"CACHE_MAX_MB", "CACHE_TTL_TILES", "CACHE_TTL_GLYPHS", "CACHE_TTL_GEOCODE",
@@ -29,7 +29,6 @@ func setValidEnv(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("UPSTREAM_TILES_URL", "https://maps.example.com/ecuador/")
 	t.Setenv("UPSTREAM_GLYPHS_URL", "https://maps.example.com/font")
-	t.Setenv("UPSTREAM_PHOTON_URL", "https://photon.example.com")
 	t.Setenv("UPSTREAM_PELIAS_URL", "https://pelias.example.com")
 	t.Setenv("UPSTREAM_VALHALLA_URL", "https://valhalla.example.com")
 	t.Setenv("MAPS_JWT_SECRET", "this-is-a-secret-key-for-tests-only-32")
@@ -69,7 +68,7 @@ func TestLoad_InvalidValues(t *testing.T) {
 		"APP_ENV":                     "invalid",
 		"PORT":                        "abc",
 		"CACHE_TTL_TILES":             "not-a-duration",
-		"UPSTREAM_PHOTON_URL":         "photon.example.com",
+		"UPSTREAM_PELIAS_URL":         "pelias.example.com",
 		"RATE_LIMIT_TILES_PER_MINUTE": "0",
 		"CACHE_MAX_MB":                "-1",
 	}

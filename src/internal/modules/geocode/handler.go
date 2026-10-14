@@ -18,48 +18,16 @@ const (
 	maxQueryLength = 200
 	countryCode    = "EC"
 	defaultLocale  = "es"
-	// Zoom con el que Photon prioriza por cercania: abarca una ciudad.
-	photonFocusZoom = "12"
 )
-
-// Rectangulo de busqueda por defecto: Ecuador y una franja cercana.
-var ecuadorBBox = validator.BBox{MinLon: -81.5, MinLat: -6.5, MaxLon: -74.5, MaxLat: 1.5}
 
 type Handler struct {
 	Infra *app.Infrastructure
 }
 
-// PhotonSearch: GET /geocode/search?q=&locale=&bbox=minLon,minLat,maxLon,maxLat&focus=lat,lng
-func (h *Handler) PhotonSearch(c *fiber.Ctx) error {
-	q, ok := searchText(c)
-	if !ok {
-		return response.Error(c, "missing or invalid q parameter", fiber.StatusBadRequest)
-	}
-
-	// El cliente puede acotar la busqueda (p. ej. al barrio elegido); si el
-	// rectangulo no sirve se busca en todo Ecuador.
-	bbox, ok := validator.ParseBBox(c.Query("bbox"))
-	if !ok {
-		bbox = ecuadorBBox
-	}
-
-	query := url.Values{}
-	query.Set("q", q)
-	query.Set("lang", photonLang(c.Query("locale")))
-	query.Set("limit", strconv.Itoa(searchLimit))
-	query.Set("bbox", bbox.String())
-	query.Set("countrycode", countryCode)
-	if lat, lng, ok := focusPoint(c); ok {
-		query.Set("lat", lat)
-		query.Set("lon", lng)
-		query.Set("zoom", photonFocusZoom)
-	}
-
-	return h.search(c, h.Infra.Config.Upstream.PhotonURL, "/api", query, "q", photonTransform)
-}
-
-// PhotonReverse: GET /geocode/reverse?lat=&lng=&locale=
-func (h *Handler) PhotonReverse(c *fiber.Ctx) error {
+// Reverse: GET /geocode/reverse?lat=&lng=&locale=
+// Sin capas: Pelias devuelve la direccion o el lugar mas cercano y, si no hay
+// ninguno cerca, cae solo al barrio o la ciudad.
+func (h *Handler) Reverse(c *fiber.Ctx) error {
 	lat, lng, err := validator.ParseLatLng(c.Query("lat"), c.Query("lng"))
 	if err != nil {
 		return response.Error(c, err.Error(), fiber.StatusBadRequest)
@@ -67,18 +35,18 @@ func (h *Handler) PhotonReverse(c *fiber.Ctx) error {
 
 	// Cuatro decimales (unos 11 m): puntos cercanos comparten la entrada de cache.
 	query := url.Values{}
-	query.Set("lat", strconv.FormatFloat(lat, 'f', 4, 64))
-	query.Set("lon", strconv.FormatFloat(lng, 'f', 4, 64))
-	query.Set("lang", photonLang(c.Query("locale")))
-	query.Set("limit", "1")
+	query.Set("point.lat", strconv.FormatFloat(lat, 'f', 4, 64))
+	query.Set("point.lon", strconv.FormatFloat(lng, 'f', 4, 64))
+	query.Set("lang", locale(c.Query("locale")))
+	query.Set("size", "1")
 
-	return h.forward(c, h.Infra.Config.Upstream.PhotonURL, "/reverse", query, photonTransform)
+	return h.forward(c, h.Infra.Config.Upstream.PeliasURL, "/v1/reverse", query, peliasTransform)
 }
 
-// PeliasSearch: GET /pelias/search?q=&locale=&bbox=minLon,minLat,maxLon,maxLat&focus=lat,lng
+// Search: GET /geocode/search?q=&locale=&bbox=minLon,minLat,maxLon,maxLat&focus=lat,lng
 // Va por autocomplete: empata por prefijo mientras se escribe y encuentra los
 // lugares por nombre (edificios, centros comerciales), no solo direcciones.
-func (h *Handler) PeliasSearch(c *fiber.Ctx) error {
+func (h *Handler) Search(c *fiber.Ctx) error {
 	q, ok := searchText(c)
 	if !ok {
 		return response.Error(c, "missing or invalid q parameter", fiber.StatusBadRequest)
@@ -167,15 +135,5 @@ func locale(raw string) string {
 		return raw
 	default:
 		return defaultLocale
-	}
-}
-
-// Photon solo responde en estos idiomas; cualquier otro va como "default".
-func photonLang(raw string) string {
-	switch raw = strings.ToLower(strings.TrimSpace(raw)); raw {
-	case "de", "en", "fr":
-		return raw
-	default:
-		return "default"
 	}
 }
